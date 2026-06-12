@@ -4,15 +4,16 @@ Production AI Agent — Kết hợp tất cả Day 12 concepts
 Checklist:
   ✅ Config từ environment (12-factor)
   ✅ Structured JSON logging
-  ✅ API Key authentication
-  ✅ Rate limiting
-  ✅ Cost guard
+  ✅ API Key authentication (tách module app/auth.py)
+  ✅ Rate limiting (tách module app/rate_limiter.py + Redis-backed)
+  ✅ Cost guard (tách module app/cost_guard.py + Redis-backed)
   ✅ Input validation (Pydantic)
-  ✅ Health check + Readiness probe
+  ✅ Health check + Readiness probe (Redis connection check)
   ✅ Graceful shutdown
   ✅ Security headers
   ✅ CORS
   ✅ Error handling
+  ✅ Stateless Session (Conversation history in Redis)
 """
 import os
 import time
@@ -20,18 +21,19 @@ import signal
 import logging
 import json
 from datetime import datetime, timezone
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
-from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
 from app.config import settings
+from app.auth import verify_api_key
+from app.rate_limiter import check_rate_limit
+from app.cost_guard import check_budget, record_cost
 
-# Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
+# Mock LLM
 from utils.mock_llm import ask as llm_ask
 
 # ─────────────────────────────────────────────────────────
@@ -49,52 +51,65 @@ _request_count = 0
 _error_count = 0
 
 # ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
+# Redis Storage for Stateless Sessions
 # ─────────────────────────────────────────────────────────
-_rate_windows: dict[str, deque] = defaultdict(deque)
+USE_REDIS = False
+_redis = None
+if settings.redis_url:
+    try:
+        import redis
+        _redis = redis.from_url(settings.redis_url, decode_responses=True)
+        _redis.ping()
+        USE_REDIS = True
+        logger.info("Connected to Redis for Stateless Session Management")
+    except Exception as e:
+        USE_REDIS = False
+        logger.warning(f"Redis not available: {e} — using in-memory store")
 
-def check_rate_limit(key: str):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
+_memory_sessions = {}
 
-# ─────────────────────────────────────────────────────────
-# Simple Cost Guard
-# ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
+def get_session_history(user_id: str) -> list:
+    if USE_REDIS:
+        try:
+            val = _redis.get(f"history:{user_id}")
+            return json.loads(val) if val else []
+        except Exception:
+            pass
+    return _memory_sessions.get(user_id, [])
 
-def check_and_record_cost(input_tokens: int, output_tokens: int):
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
+def save_session_history(user_id: str, history: list):
+    if len(history) > 20:
+        history = history[-20:]
+    if USE_REDIS:
+        try:
+            _redis.setex(f"history:{user_id}", 3600 * 24, json.dumps(history))
+            return
+        except Exception:
+            pass
+    _memory_sessions[user_id] = history
 
-# ─────────────────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────────────────
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-def verify_api_key(api_key: str = Security(api_key_header)) -> str:
-    if not api_key or api_key != settings.agent_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key. Include header: X-API-Key: <key>",
-        )
-    return api_key
+# Context-aware mock LLM call using history
+def get_contextual_answer(question: str, history: list) -> str:
+    question_lower = question.lower()
+    if "what is my name" in question_lower or "tên tôi là gì" in question_lower:
+        for msg in reversed(history):
+            if msg["role"] == "user":
+                content_lower = msg["content"].lower()
+                if "my name is" in content_lower:
+                    name = msg["content"].split("is")[-1].strip().strip(".").strip()
+                    return f"Your name is {name}."
+                if "tên tôi là" in content_lower:
+                    name = msg["content"].split("là")[-1].strip().strip(".").strip()
+                    return f"Tên của bạn là {name}."
+        return "I don't know your name yet. Please tell me your name first."
+        
+    if "what did i just say" in question_lower or "tôi vừa nói gì" in question_lower:
+        user_msgs = [m for m in history if m["role"] == "user"]
+        if len(user_msgs) >= 2:
+            return f"You just said: '{user_msgs[-2]['content']}'"
+        return "You haven't said anything before this."
+        
+    return llm_ask(question)
 
 # ─────────────────────────────────────────────────────────
 # Lifespan
@@ -142,7 +157,6 @@ async def request_middleware(request: Request, call_next):
     _request_count += 1
     try:
         response: Response = await call_next(request)
-        # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers.pop("server", None)
@@ -165,6 +179,7 @@ async def request_middleware(request: Request, call_next):
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000,
                           description="Your question for the agent")
+    user_id: str | None = Field(None, description="Unique identifier for the user session")
 
 class AskResponse(BaseModel):
     question: str
@@ -189,7 +204,6 @@ def root():
         },
     }
 
-
 @app.post("/ask", response_model=AskResponse, tags=["Agent"])
 async def ask_agent(
     body: AskRequest,
@@ -201,23 +215,38 @@ async def ask_agent(
 
     **Authentication:** Include header `X-API-Key: <your-key>`
     """
-    # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
+    user_id = body.user_id or "default_user"
+    
+    # Rate limit per API key / user
+    check_rate_limit(user_id)
 
     # Budget check
-    input_tokens = len(body.question.split()) * 2
-    check_and_record_cost(input_tokens, 0)
+    check_budget(user_id)
+
+    # Get conversation history from Redis/memory
+    history = get_session_history(user_id)
+
+    # Append user question to history
+    history.append({"role": "user", "content": body.question})
 
     logger.info(json.dumps({
         "event": "agent_call",
+        "user_id": user_id,
         "q_len": len(body.question),
         "client": str(request.client.host) if request.client else "unknown",
     }))
 
-    answer = llm_ask(body.question)
+    # Get answer (context-aware mock LLM call)
+    answer = get_contextual_answer(body.question, history)
 
+    # Append assistant answer to history
+    history.append({"role": "assistant", "content": answer})
+    save_session_history(user_id, history)
+
+    # Cost tracking
+    input_tokens = len(body.question.split()) * 2
     output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
+    record_cost(user_id, input_tokens, output_tokens)
 
     return AskResponse(
         question=body.question,
@@ -225,7 +254,6 @@ async def ask_agent(
         model=settings.llm_model,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
-
 
 @app.get("/health", tags=["Operations"])
 def health():
@@ -242,27 +270,31 @@ def health():
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-
 @app.get("/ready", tags=["Operations"])
 def ready():
     """Readiness probe. Load balancer stops routing here if not ready."""
     if not _is_ready:
         raise HTTPException(503, "Not ready")
+    if USE_REDIS:
+        try:
+            _redis.ping()
+        except Exception:
+            raise HTTPException(503, "Redis not available")
     return {"ready": True}
-
 
 @app.get("/metrics", tags=["Operations"])
 def metrics(_key: str = Depends(verify_api_key)):
     """Basic metrics (protected)."""
+    user_id = "default_user"
+    daily_cost = get_user_cost(user_id)
     return {
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
         "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
+        "daily_cost_usd": round(daily_cost, 4),
         "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
+        "budget_used_pct": round(daily_cost / settings.daily_budget_usd * 100, 1),
     }
-
 
 # ─────────────────────────────────────────────────────────
 # Graceful Shutdown
@@ -271,7 +303,6 @@ def _handle_signal(signum, _frame):
     logger.info(json.dumps({"event": "signal", "signum": signum}))
 
 signal.signal(signal.SIGTERM, _handle_signal)
-
 
 if __name__ == "__main__":
     logger.info(f"Starting {settings.app_name} on {settings.host}:{settings.port}")
